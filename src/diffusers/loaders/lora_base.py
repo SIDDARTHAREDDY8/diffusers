@@ -383,11 +383,18 @@ def _load_lora_into_text_encoder(
         # convert state dict
         state_dict = convert_state_dict_to_peft(state_dict)
 
-        for name, _ in text_encoder.named_modules():
-            if name.endswith((".q_proj", ".k_proj", ".v_proj", ".out_proj", ".fc1", ".fc2")):
-                rank_key = f"{name}.lora_B.weight"
-                if rank_key in state_dict:
-                    rank[rank_key] = state_dict[rank_key].shape[1]
+        # CLIPTextModel is flattened in recent transformers versions, while older
+        # LoRA checkpoints can still contain the 'text_model.' prefix.
+        if not hasattr(text_encoder, "text_model"):
+            state_dict = {k.removeprefix("text_model."): v for k, v in state_dict.items()}
+
+        # Read the rank from every `lora_B` key, mirroring `loaders/peft.py`. Restricting this to
+        # CLIP module names (`.q_proj`/`.k_proj`/`.v_proj`/`.out_proj`/`.fc1`/`.fc2`) would leave
+        # every other text encoder (T5, SmolLM3, ChatGLM, ...) with the most frequent rank, which
+        # fails with a size mismatch for adapters whose modules have different ranks.
+        for key, value in state_dict.items():
+            if "lora_B" in key and value.ndim > 1:
+                rank[key] = value.shape[1]
 
         if network_alphas is not None:
             alpha_keys = [k for k in network_alphas.keys() if k.startswith(prefix) and k.split(".")[0] == prefix]
@@ -916,7 +923,7 @@ class LoraBaseMixin:
 
         for component in self._lora_loadable_modules:
             model = getattr(self, component, None)
-            if model is not None and issubclass(model.__class__, ModelMixin):
+            if model is not None and issubclass(model.__class__, (ModelMixin, PreTrainedModel)):
                 for module in model.modules():
                     if isinstance(module, BaseTunerLayer):
                         active_adapters = module.active_adapters

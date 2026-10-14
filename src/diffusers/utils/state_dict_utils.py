@@ -132,6 +132,13 @@ PEFT_TO_DIFFUSERS = {
     "to_v.lora_B": "to_v.lora.up",
     "to_out.0.lora_A": "to_out.0.lora.down",
     "to_out.0.lora_B": "to_out.0.lora.up",
+    "text_projection.lora_A.weight": "text_projection.lora.down.weight",
+    "text_projection.lora_B.weight": "text_projection.lora.up.weight",
+    # Generic fallback for modules that are not CLIP-named, e.g. T5 (`q`/`k`/`v`/`o`), SmolLM3
+    # (`o_proj`, `gate_proj`) or ChatGLM (`query_key_value`) text encoders. The specific patterns
+    # above are matched first, so this only applies to names no specific pattern covers.
+    ".lora_A": ".lora_linear_layer.down",
+    ".lora_B": ".lora_linear_layer.up",
 }
 
 DIFFUSERS_OLD_TO_DIFFUSERS = {
@@ -224,8 +231,17 @@ def convert_state_dict_to_peft(state_dict, original_type=None, **kwargs):
             original_type = StateDictType.DIFFUSERS_OLD
         elif any("lora_linear_layer" in k for k in state_dict.keys()):
             original_type = StateDictType.DIFFUSERS
+        elif any(".lora_A" in k or ".lora_B" in k for k in state_dict.keys()):
+            # Already in PEFT format. This must not rely on CLIP module names: text encoders such
+            # as T5, SmolLM3 or ChatGLM name their modules differently, and a PEFT state dict
+            # needs no conversion regardless of the module names it contains.
+            return state_dict
         else:
             raise ValueError("Could not automatically infer state dict type")
+
+    if original_type == StateDictType.PEFT:
+        # Already in PEFT format, nothing to convert.
+        return state_dict
 
     if original_type not in PEFT_STATE_DICT_MAPPINGS.keys():
         raise ValueError(f"Original type {original_type} is not supported")
@@ -266,7 +282,15 @@ def convert_state_dict_to_diffusers(state_dict, original_type=None, **kwargs):
         # Old diffusers to PEFT
         if any("to_out_lora" in k for k in state_dict.keys()):
             original_type = StateDictType.DIFFUSERS_OLD
-        elif any(f".lora_A{peft_adapter_name}.weight" in k for k in state_dict.keys()):
+        elif any(
+            f".lora_A{peft_adapter_name}.weight" in k
+            or f".lora_B{peft_adapter_name}.weight" in k
+            or ".lora_A." in k
+            or ".lora_B." in k
+            for k in state_dict.keys()
+        ):
+            # PEFT format, inferred from the `lora_A`/`lora_B` suffix alone so that text encoders
+            # whose modules are not CLIP-named (T5, SmolLM3, ChatGLM, ...) are recognized too.
             original_type = StateDictType.PEFT
         elif any("lora_linear_layer" in k for k in state_dict.keys()):
             # nothing to do

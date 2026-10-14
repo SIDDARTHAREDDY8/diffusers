@@ -252,15 +252,6 @@ class TestBriaFiboEditPipelineMemory(BriaFiboEditPipelineTesterConfig, MemoryTes
 class TestBriaFiboEditPipelineLoRA(BriaFiboEditPipelineTesterConfig, LoraTesterMixin):
     """LoRA tests for the Bria FIBO Edit pipeline."""
 
-    @pytest.mark.skip(
-        "`_load_lora_into_text_encoder` only infers per-module ranks for CLIP-style names "
-        "(`.q_proj`/`.k_proj`/`.v_proj`/`.out_proj`/`.fc1`/`.fc2`, see `src/diffusers/loaders/lora_base.py`), so the "
-        "LLaMA-style `.o_proj` on the SmolLM3 text encoder falls back to the default rank and the non-uniform "
-        "`rank_pattern` this test builds cannot round-trip."
-    )
-    def test_simple_inference_with_partial_text_lora(self):
-        pass
-
 
 class TestBriaFiboEditPipelineLoRAMemory(BriaFiboEditPipelineTesterConfig, LoraMemoryTesterMixin):
     """LoRA x memory-optimization tests (group offload, CPU offload) for the Bria FIBO Edit pipeline."""
