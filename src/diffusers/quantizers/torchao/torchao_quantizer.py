@@ -51,8 +51,24 @@ if is_torch_available():
     import torch
     import torch.nn as nn
 
+FqnToConfig = None
+
 if is_torchao_available():
-    from torchao.quantization import FqnToConfig, quantize_
+    from torchao.quantization import quantize_
+
+    try:
+        from torchao.quantization import FqnToConfig
+    except ImportError:
+        # `FqnToConfig` is the renamed `ModuleFqnToConfig`, and some torchao releases only
+        # expose one of the two names. Fall back to the other name so that a torchao build
+        # without `FqnToConfig` does not make diffusers itself unimportable (see
+        # https://github.com/huggingface/diffusers/issues/15085). When neither name is
+        # available, per-fqn quantization is unsupported but the other TorchAO configs
+        # keep working.
+        try:
+            from torchao.quantization import ModuleFqnToConfig as FqnToConfig
+        except ImportError:
+            FqnToConfig = None
 
     if is_torchao_version(">=", "0.16.0"):
         from torchao.prototype.safetensors.safetensors_support import (
@@ -107,6 +123,25 @@ if (
     _update_torch_safe_globals()
 
 
+def _is_fqn_to_config(config) -> bool:
+    """
+    Return whether `config` is a per-fqn TorchAO config.
+
+    `FqnToConfig` is `None` when the installed torchao does not expose the class under
+    either of its names, in which case no config can be one.
+    """
+    return FqnToConfig is not None and isinstance(config, FqnToConfig)
+
+
+def _get_fqn_to_config_mapping(config: "FqnToConfig") -> dict:
+    # `ModuleFqnToConfig` (the pre-rename class) stores the same mapping under its
+    # original attribute name; current torchao keeps the two attributes in sync.
+    fqn_to_config = getattr(config, "fqn_to_config", None)
+    if fqn_to_config is None:
+        fqn_to_config = config.module_fqn_to_config
+    return fqn_to_config
+
+
 def fuzzy_match_size(config_name: str) -> str | None:
     """
     Extract the size digit from strings like "4weight", "8weight". Returns the digit as an integer if found, otherwise
@@ -129,7 +164,7 @@ def _fqn_to_config_weight_sizes(config: "FqnToConfig") -> tuple[set[str | None],
     Returns the size digits (as `fuzzy_match_size` reports them) of every config it maps to, along with whether the
     config leaves modules unquantized -- either mapped to `None`, or unmatched with no `_default` to fall back on.
     """
-    fqn_to_config = config.fqn_to_config
+    fqn_to_config = _get_fqn_to_config_mapping(config)
     size_digits = {fuzzy_match_size(type(c).__name__) for c in fqn_to_config.values() if c is not None}
     leaves_modules_unquantized = "_default" not in fqn_to_config or any(c is None for c in fqn_to_config.values())
     return size_digits, leaves_modules_unquantized
@@ -143,7 +178,7 @@ def _resolve_fqn_to_config(config: "FqnToConfig", module_fqn: str, param_fqn: st
     is `""` and whose parameters are named `weight`/`bias`. Full-path patterns therefore never match on their own, and
     the config silently falls through to `_default`.
     """
-    fqn_to_config = config.fqn_to_config
+    fqn_to_config = _get_fqn_to_config_mapping(config)
 
     for fqn in (param_fqn, module_fqn):
         if fqn in fqn_to_config:
@@ -240,7 +275,7 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
         from accelerate.utils import CustomDtype
 
         quant_type = self.quantization_config.quant_type
-        if isinstance(quant_type, FqnToConfig):
+        if _is_fqn_to_config(quant_type):
             size_digits, leaves_modules_unquantized = _fqn_to_config_weight_sizes(quant_type)
             if leaves_modules_unquantized:
                 # Modules the config skips keep `target_dtype`, so shrinking the estimate for every parameter would
@@ -384,13 +419,13 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
             module._parameters[tensor_name] = torch.nn.Parameter(param_value.to(device=target_device))
 
             retrieved_config = self.quantization_config.get_apply_tensor_subclass()
-            if isinstance(retrieved_config, FqnToConfig):
+            if _is_fqn_to_config(retrieved_config):
                 module_fqn = param_name.rsplit(".", 1)[0] if "." in param_name else ""
                 retrieved_config = _resolve_fqn_to_config(retrieved_config, module_fqn, param_name)
                 if retrieved_config is None:
                     # This module is either explicitly excluded or unmatched with no `_default`, so it stays unquantized.
                     return
-                if isinstance(retrieved_config, FqnToConfig):
+                if _is_fqn_to_config(retrieved_config):
                     # `quantize_` matches an `FqnToConfig` against the fqns of the module it is handed, which here is a
                     # lone `nn.Linear`. The resolution above is what keeps fqn targeting working, so a config that is
                     # still an `FqnToConfig` at this point would quantize nothing at all rather than erroring.
@@ -417,7 +452,7 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
         - Use a division factor of 4 for int8 weights
         """
         quant_type = self.quantization_config.quant_type
-        if isinstance(quant_type, FqnToConfig):
+        if _is_fqn_to_config(quant_type):
             # Pre-allocating more than the model ends up using can OOM the warmup itself, so assume the narrowest
             # weights this config can produce. Modules it leaves unquantized only make the estimate safer.
             size_digits, _ = _fqn_to_config_weight_sizes(quant_type)

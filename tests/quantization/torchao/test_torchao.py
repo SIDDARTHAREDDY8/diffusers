@@ -14,6 +14,11 @@
 # limitations under the License.
 
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from diffusers import TorchAoConfig
@@ -73,3 +78,84 @@ class TestTorchAoConfig:
         quantization_repr = repr(quantization_config)
         assert "TorchAoConfig" in quantization_repr
         assert "torchao" in quantization_repr
+
+
+@require_torch
+class TestTorchAoQuantizerImportWithoutFqnToConfig:
+    """
+    Regression tests for https://github.com/huggingface/diffusers/issues/15085.
+
+    Some torchao builds do not expose `FqnToConfig` from `torchao.quantization` (it is
+    the renamed `ModuleFqnToConfig`, and not every release exposes both names). Importing
+    diffusers must not fail in that case. Each test imports the TorchAO quantizer in a
+    subprocess whose `torchao` package is a stub missing `FqnToConfig`.
+    """
+
+    def _run_with_stub_torchao(self, tmp_path, quantization_init, mode):
+        stub_root = tmp_path / mode
+        quantization_dir = stub_root / "torchao" / "quantization"
+        quantization_dir.mkdir(parents=True)
+        (stub_root / "torchao" / "__init__.py").write_text("")
+        (quantization_dir / "__init__.py").write_text(quantization_init)
+        dist_info_dir = stub_root / "torchao-0.15.0.dist-info"
+        dist_info_dir.mkdir()
+        (dist_info_dir / "METADATA").write_text("Metadata-Version: 2.1\nName: torchao\nVersion: 0.15.0\n")
+        (dist_info_dir / "top_level.txt").write_text("torchao\n")
+
+        script = textwrap.dedent(
+            """
+            import sys
+
+            mode = sys.argv[1]
+
+            import diffusers
+            from diffusers.quantizers.torchao.torchao_quantizer import (
+                FqnToConfig,
+                _is_fqn_to_config,
+                _resolve_fqn_to_config,
+            )
+
+            # The import path from the issue report must keep working.
+            _ = diffusers.DDIMScheduler
+
+            if mode == "missing":
+                assert FqnToConfig is None, FqnToConfig
+                assert not _is_fqn_to_config(object())
+            else:
+                import torchao.quantization as torchao_quantization
+
+                assert FqnToConfig is torchao_quantization.ModuleFqnToConfig
+                config = torchao_quantization.ModuleFqnToConfig({"_default": "fallback"})
+                assert _is_fqn_to_config(config)
+                assert _resolve_fqn_to_config(config, "some.module", "some.module.weight") == "fallback"
+
+            print("ok")
+            """
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(stub_root) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c", script, mode], env=env, capture_output=True, text=True, timeout=600
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_import_without_any_fqn_to_config(self, tmp_path):
+        self._run_with_stub_torchao(
+            tmp_path,
+            "def quantize_(*args, **kwargs):\n    raise NotImplementedError\n",
+            mode="missing",
+        )
+
+    def test_import_with_only_module_fqn_to_config(self, tmp_path):
+        quantization_init = textwrap.dedent(
+            """
+            def quantize_(*args, **kwargs):
+                raise NotImplementedError
+
+
+            class ModuleFqnToConfig:
+                def __init__(self, module_fqn_to_config=None):
+                    self.module_fqn_to_config = module_fqn_to_config or {}
+            """
+        )
+        self._run_with_stub_torchao(tmp_path, quantization_init, mode="renamed")
